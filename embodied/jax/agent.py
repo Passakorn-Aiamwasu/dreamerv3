@@ -25,7 +25,7 @@ class Options:
   train_devices: tuple = (0,)
   policy_mesh: str = '-1,1,1'
   train_mesh: str = '-1,1,1'
-  profiler: bool = True
+  profiler: bool = False
   expect_devices: int = 0
   use_shardmap: bool = False
   enable_policy: bool = True
