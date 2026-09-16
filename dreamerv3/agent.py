@@ -59,23 +59,31 @@ class Agent(embodied.jax.Agent):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
-    shadow_kw = {k: config.shadow[k] for k in ('units', 'layers')}
-    self.shadow = [
-        ShadowModel(
-            act_space,
-            classes=self.dyn.classes,
-            stoch=self.dyn.stoch,
-            unimix=self.dyn.unimix,
-            **shadow_kw,
-            name=f'shadow{i}')
-        for i in range(config.shadow.n_models)]
-    # Running average of the shadow ensemble's raw disagreement U_t, used to
-    # normalize it into a scale-free Ũ_t before turning it into a confidence
-    # weight (design decision #6). Initialized to -1 as an "uninitialized"
-    # sentinel (U_t is always >= 0), bootstrapped on first use -- see
-    # _shadow_confidence().
-    init = lambda shape, dtype: -jnp.ones(shape, dtype)
-    self.shadow_u_ema = nj.Variable(init, (), f32, name='shadow_u_ema')
+    # config.shadow.enabled is an ablation switch (next-step 5): with it
+    # False, no shadow modules are created at all and Agent.loss() falls
+    # back to the pre-shadow behavior exactly (no 'shadow' loss key, no
+    # confidence discounting of `con`), rather than merely zeroing out the
+    # shadow loss scale, which would still apply confidence weighting from
+    # an untrained ensemble.
+    self.shadow = []
+    if config.shadow.enabled:
+      shadow_kw = {k: config.shadow[k] for k in ('units', 'layers')}
+      self.shadow = [
+          ShadowModel(
+              act_space,
+              classes=self.dyn.classes,
+              stoch=self.dyn.stoch,
+              unimix=self.dyn.unimix,
+              **shadow_kw,
+              name=f'shadow{i}')
+          for i in range(config.shadow.n_models)]
+      # Running average of the shadow ensemble's raw disagreement U_t, used
+      # to normalize it into a scale-free Ũ_t before turning it into a
+      # confidence weight (design decision #6). Initialized to -1 as an
+      # "uninitialized" sentinel (U_t is always >= 0), bootstrapped on
+      # first use -- see _shadow_confidence().
+      init = lambda shape, dtype: -jnp.ones(shape, dtype)
+      self.shadow_u_ema = nj.Variable(init, (), f32, name='shadow_u_ema')
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -101,6 +109,8 @@ class Agent(embodied.jax.Agent):
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    if not config.shadow.enabled:
+      del scales['shadow']
     self.scales = scales
 
   @property
@@ -238,25 +248,26 @@ class Agent(embodied.jax.Agent):
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
 
-    # Shadow ensemble: predict z_{t+1} from (z_t, a_t) as a lightweight,
-    # independently-initialized model of the RSSM's own transition, used to
-    # measure imagination uncertainty via ensemble disagreement. Trained by
-    # cross-entropy against the RSSM's own sampled posterior, with the RSSM
-    # treated as a fixed target (stop_gradient on every shadow input) so
-    # shadow training never influences the world model itself.
-    z = repfeat['stoch']
-    shadow_zt = sg(z[:, :-1])
-    shadow_target = sg(z[:, 1:])
-    shadow_at = {k: sg(v[:, :-1]) for k, v in prevact.items()}
-    shadow_logps = []
-    for shadow in self.shadow:
-      dist = shadow.dist(shadow(shadow_zt, shadow_at))
-      shadow_logps.append(dist.logp(shadow_target).sum(-1))
-    shadow_loss = -jnp.mean(jnp.stack(shadow_logps, 0), 0)
-    # No target exists for the last step (there is no z_{T} to predict from
-    # z_{T-1} within this chunk), so pad with zero to match (B, T).
-    losses['shadow'] = jnp.concatenate(
-        [shadow_loss, jnp.zeros_like(shadow_loss[:, :1])], 1)
+    if self.config.shadow.enabled:
+      # Shadow ensemble: predict z_{t+1} from (z_t, a_t) as a lightweight,
+      # independently-initialized model of the RSSM's own transition, used
+      # to measure imagination uncertainty via ensemble disagreement.
+      # Trained by cross-entropy against the RSSM's own sampled posterior,
+      # with the RSSM treated as a fixed target (stop_gradient on every
+      # shadow input) so shadow training never influences the world model.
+      z = repfeat['stoch']
+      shadow_zt = sg(z[:, :-1])
+      shadow_target = sg(z[:, 1:])
+      shadow_at = {k: sg(v[:, :-1]) for k, v in prevact.items()}
+      shadow_logps = []
+      for shadow in self.shadow:
+        dist = shadow.dist(shadow(shadow_zt, shadow_at))
+        shadow_logps.append(dist.logp(shadow_target).sum(-1))
+      shadow_loss = -jnp.mean(jnp.stack(shadow_logps, 0), 0)
+      # No target exists for the last step (there is no z_{T} to predict
+      # from z_{T-1} within this chunk), so pad with zero to match (B, T).
+      losses['shadow'] = jnp.concatenate(
+          [shadow_loss, jnp.zeros_like(shadow_loss[:, :1])], 1)
 
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
@@ -283,18 +294,20 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
 
-    # Shadow ensemble uncertainty/confidence, queried at every imagined
-    # step (imgact[:, t] is the action taken AT imgfeat[:, t], i.e. exactly
-    # the (z_t, a_t) pair each shadow model was trained to predict from).
-    # Mixed into the continuation probability below (design decision #5)
-    # instead of hard-stopping the rollout, reusing imag_loss()'s existing
-    # discounting machinery.
-    shadow_conf, shadow_u = self._shadow_confidence(imgfeat, imgact, training)
-    metrics['shadow_uncertainty'] = shadow_u.mean()
-    metrics['shadow_confidence'] = shadow_conf.mean()
-
     inp = self.feat2tensor(imgfeat)
-    adjusted_con = self.con(inp, 2).prob(1) * shadow_conf
+    adjusted_con = self.con(inp, 2).prob(1)
+    if self.config.shadow.enabled:
+      # Shadow ensemble uncertainty/confidence, queried at every imagined
+      # step (imgact[:, t] is the action taken AT imgfeat[:, t], i.e.
+      # exactly the (z_t, a_t) pair each shadow model was trained to
+      # predict from). Mixed into the continuation probability (design
+      # decision #5) instead of hard-stopping the rollout, reusing
+      # imag_loss()'s existing discounting machinery.
+      shadow_conf, shadow_u = self._shadow_confidence(
+          imgfeat, imgact, training)
+      metrics['shadow_uncertainty'] = shadow_u.mean()
+      metrics['shadow_confidence'] = shadow_conf.mean()
+      adjusted_con = adjusted_con * shadow_conf
     los, imgloss_out, mets = imag_loss(
         imgact,
         self.rew(inp, 2).pred(),
