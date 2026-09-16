@@ -107,21 +107,6 @@ carry = rssm.initial(BATCH)
 
 
 # ============================================================
-# Manual unimix-mixed softmax.
-#
-# Used ONLY to derive per-class probabilities for the
-# disagreement (KL) computation below, since the OneHot
-# distribution object returned by shadow.dist() does not expose
-# a `.probs` attribute directly (confirmed by AttributeError).
-#
-# IMPORTANT: this must match whatever mixing shadow.dist() does
-# internally. It is verified against dist.logp() below before
-# being trusted for the disagreement metric -- if that check
-# fails, this formula (or the unimix value) does not match the
-# real implementation in dreamerv3/shadow.py and must be fixed.
-# ============================================================
-
-# ============================================================
 # Forward
 #
 # Modules are captured through closure.
@@ -261,8 +246,15 @@ def make_loss_fn(rssm, shadows):
         )
 
         # ----------------------------------------------------
-        # Manual per-class probabilities for the disagreement
-        # metric (dist object has no .probs attribute).
+        # Per-class probabilities for the disagreement metric.
+        #
+        # dist is a OneHot output; dist.dist is the underlying
+        # Categorical, whose .logits are already the unimix-mixed,
+        # f32-cast logits computed by Categorical.__init__ (see
+        # embodied/jax/outs.py). Reading dist.dist.logits directly
+        # reuses that computation instead of reimplementing unimix
+        # mixing here, so there is no risk of the two drifting
+        # apart.
         #
         # Shape:
         #   [Shadow, B, T-1, STOCH, CLASSES]
@@ -274,15 +266,17 @@ def make_loss_fn(rssm, shadows):
         ])
 
         # ----------------------------------------------------
-        # Self-check: does unimix_probs match what dist.logp()
-        # actually computes internally? Compare log-prob derived
-        # from our manual probs against the official dist.logp()
-        # output, for shadow 0 only (cheap, representative check).
+        # Self-check: does log-softmax over dist.dist.logits match
+        # what OneHot.logp() actually returns? Compare log-prob
+        # derived from `probs` above against the official
+        # dist.logp() output, for shadow 0 only (cheap,
+        # representative check).
         #
-        # If this diverges, unimix_probs() (or the unimix value
-        # passed to it) does not match dreamerv3/shadow.py's real
-        # OneHot implementation, and the disagreement metric below
-        # would be computed against the wrong distribution.
+        # If this diverges, it means dist.dist.logits no longer
+        # reflects OneHot's internal mixing (e.g. after a change to
+        # dreamerv3/shadow.py or embodied/jax/outs.py), and the
+        # disagreement metric below would be computed against the
+        # wrong distribution.
         # ----------------------------------------------------
 
         manual_logp_0 = (
@@ -401,13 +395,34 @@ print()
 
 
 # ============================================================
-# Consistency check: manual unimix_probs vs official dist.logp()
+# Consistency check: log-softmax(dist.dist.logits) vs OneHot.logp()
 # ============================================================
 
 print(
-    "Manual-vs-official logp max abs diff (shadow0):",
+    "dist.dist.logits-vs-official logp max abs diff (shadow0):",
     float(metrics['logp_consistency_error']),
 )
+
+
+# ============================================================
+# Unimix verification: probs must stay strictly positive.
+#
+# With unimix mixing, probs = (1 - unimix) * softmax + unimix *
+# uniform, so no class can ever collapse to exactly 0 -- the
+# uniform term puts a floor of unimix / CLASSES under every
+# probability, regardless of how peaked the softmax gets. This
+# floor is what keeps logp() finite (no -inf) for any sampled
+# target, including classes the shadow model currently considers
+# very unlikely.
+# ============================================================
+
+probs_min = float(metrics['probs'].min())
+unimix_floor = UNIMIX / CLASSES
+
+print()
+print("Unimix verification:")
+print("  probs.min():", probs_min)
+print("  theoretical floor (unimix / classes):", unimix_floor)
 
 
 # ============================================================
@@ -582,18 +597,45 @@ assert metrics['disagreement_per_step'].shape == (
 
 
 # --------------------------------------------------
-# This is the critical check: if unimix_probs() does not match
-# shadow.dist()'s real internal mixing, this will be large and
-# the disagreement metric above cannot be trusted.
+# This is the critical check: if dist.dist.logits stops matching
+# OneHot's real internal mixing, this will be large and the
+# disagreement metric above cannot be trusted.
 # --------------------------------------------------
 
 assert float(metrics['logp_consistency_error']) < 1e-3, (
-    "unimix_probs() does not match shadow.dist()'s internal "
-    "probability computation (max abs diff = "
+    "log-softmax(dist.dist.logits) does not match OneHot.logp()'s "
+    "internal probability computation (max abs diff = "
     f"{float(metrics['logp_consistency_error'])}). "
-    "Inspect dreamerv3/shadow.py's dist()/OneHot implementation "
-    "and fix unimix_probs() to match before trusting the "
-    "disagreement metric."
+    "Inspect dreamerv3/shadow.py's dist()/OneHot usage and "
+    "embodied/jax/outs.py's Categorical/OneHot implementation "
+    "before trusting the disagreement metric."
+)
+
+
+# --------------------------------------------------
+# Unimix verification: no class probability should ever be able
+# to collapse to zero. probs = (1 - unimix) * softmax + unimix *
+# uniform guarantees probs >= unimix / classes for every entry,
+# since softmax >= 0. A near-zero probs.min() (or one at/below the
+# theoretical floor) would mean unimix is not actually being
+# applied, e.g. shadow.dist() was called with unimix=0 or the
+# OneHot mixing was bypassed.
+# --------------------------------------------------
+
+assert probs_min > 0.0, (
+    "Shadow ensemble probs contain a zero (or negative) entry -- "
+    "unimix does not appear to be applied (probs.min() = "
+    f"{probs_min}). Check that shadow.dist() is constructed with "
+    "unimix > 0 and that dreamerv3/shadow.py passes self.unimix "
+    "through to OneHot."
+)
+
+assert probs_min >= unimix_floor - 1e-6, (
+    "Shadow ensemble probs.min() is below the theoretical unimix "
+    f"floor of unimix / classes ({unimix_floor}): got {probs_min}. "
+    "This should be mathematically impossible if unimix mixing is "
+    "applied correctly -- check dreamerv3/shadow.py's dist() and "
+    "embodied/jax/outs.py's Categorical unimix mixing."
 )
 
 

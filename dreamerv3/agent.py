@@ -11,9 +11,11 @@ import numpy as np
 import optax
 
 from . import rssm
+from .shadow import ShadowModel
 
 f32 = jnp.float32
 i32 = jnp.int32
+EPS = 1e-8
 sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs)
 sample = lambda xs: jax.tree.map(lambda x: x.sample(nj.seed()), xs)
 prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
@@ -57,6 +59,24 @@ class Agent(embodied.jax.Agent):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
+    shadow_kw = {k: config.shadow[k] for k in ('units', 'layers')}
+    self.shadow = [
+        ShadowModel(
+            act_space,
+            classes=self.dyn.classes,
+            stoch=self.dyn.stoch,
+            unimix=self.dyn.unimix,
+            **shadow_kw,
+            name=f'shadow{i}')
+        for i in range(config.shadow.n_models)]
+    # Running average of the shadow ensemble's raw disagreement U_t, used to
+    # normalize it into a scale-free Ũ_t before turning it into a confidence
+    # weight (design decision #6). Initialized to -1 as an "uninitialized"
+    # sentinel (U_t is always >= 0), bootstrapped on first use -- see
+    # _shadow_confidence().
+    init = lambda shape, dtype: -jnp.ones(shape, dtype)
+    self.shadow_u_ema = nj.Variable(init, (), f32, name='shadow_u_ema')
+
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
     self.pol = embodied.jax.MLPHead(
@@ -72,7 +92,8 @@ class Agent(embodied.jax.Agent):
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val,
+        *self.shadow]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -153,6 +174,47 @@ class Agent(embodied.jax.Agent):
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
+  def _shadow_confidence(self, feat, act, training):
+    # Ensemble disagreement U_t (design decision #4): mean over shadow
+    # models of the KL between that model's predicted distribution and the
+    # ensemble mean distribution, using the full (unimix-mixed) categorical
+    # probabilities rather than a sample. dist.dist.logits is the mixed,
+    # f32 logits Categorical.__init__ already computes (see
+    # embodied/jax/outs.py); reading it directly avoids reimplementing
+    # unimix mixing (see test_shadow_ensemble.py for why that matters).
+    z, a = sg(feat['stoch']), sg(act)
+    dists = [shadow.dist(shadow(z, a)) for shadow in self.shadow]
+    probs = jnp.stack(
+        [jax.nn.softmax(dist.dist.logits, -1) for dist in dists], 0)
+    mean_probs = probs.mean(0)
+    kl = (probs * jnp.log((probs + EPS) / (mean_probs[None] + EPS))).sum(-1)
+    u = sg(kl.mean(0).sum(-1))  # Mean over shadows, sum over stoch vars.
+
+    # EMA normalization (design decision #6): keep a running average of U_t
+    # so the confidence weight is scale-free w.r.t. how large disagreement
+    # typically is for this task/training stage. shadow_u_ema is
+    # initialized to -1, a sentinel U_t (which is always >= 0) can never
+    # reach; on the very first call we bootstrap the EMA to this batch's
+    # own mean instead of blending against that sentinel, which would
+    # otherwise divide u_tilde by ~0 and collapse confidence to ~0 for the
+    # entire warmup period.
+    decay = self.config.shadow.ema_decay
+    ema = self.shadow_u_ema.read()
+    u_mean = sg(u.mean())
+    bootstrap = ema < 0
+    if training:
+      ema = jnp.where(bootstrap, u_mean, decay * ema + (1 - decay) * u_mean)
+      self.shadow_u_ema.write(ema)
+    else:
+      ema = jnp.where(bootstrap, u_mean, ema)
+    u_tilde = u / (ema + EPS)
+
+    # Confidence weight (design decision #5): always stop_gradient'd so the
+    # policy can never learn to make the ensemble agree with itself.
+    conf = jnp.exp(-self.config.shadow.alpha * jnp.maximum(
+        u_tilde - self.config.shadow.tau, 0.0))
+    return sg(conf), u
+
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
@@ -175,6 +237,27 @@ class Agent(embodied.jax.Agent):
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+
+    # Shadow ensemble: predict z_{t+1} from (z_t, a_t) as a lightweight,
+    # independently-initialized model of the RSSM's own transition, used to
+    # measure imagination uncertainty via ensemble disagreement. Trained by
+    # cross-entropy against the RSSM's own sampled posterior, with the RSSM
+    # treated as a fixed target (stop_gradient on every shadow input) so
+    # shadow training never influences the world model itself.
+    z = repfeat['stoch']
+    shadow_zt = sg(z[:, :-1])
+    shadow_target = sg(z[:, 1:])
+    shadow_at = {k: sg(v[:, :-1]) for k, v in prevact.items()}
+    shadow_logps = []
+    for shadow in self.shadow:
+      dist = shadow.dist(shadow(shadow_zt, shadow_at))
+      shadow_logps.append(dist.logp(shadow_target).sum(-1))
+    shadow_loss = -jnp.mean(jnp.stack(shadow_logps, 0), 0)
+    # No target exists for the last step (there is no z_{T} to predict from
+    # z_{T-1} within this chunk), so pad with zero to match (B, T).
+    losses['shadow'] = jnp.concatenate(
+        [shadow_loss, jnp.zeros_like(shadow_loss[:, :1])], 1)
+
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -199,11 +282,23 @@ class Agent(embodied.jax.Agent):
     imgact = concat([imgprevact, lastact], 1)
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
+
+    # Shadow ensemble uncertainty/confidence, queried at every imagined
+    # step (imgact[:, t] is the action taken AT imgfeat[:, t], i.e. exactly
+    # the (z_t, a_t) pair each shadow model was trained to predict from).
+    # Mixed into the continuation probability below (design decision #5)
+    # instead of hard-stopping the rollout, reusing imag_loss()'s existing
+    # discounting machinery.
+    shadow_conf, shadow_u = self._shadow_confidence(imgfeat, imgact, training)
+    metrics['shadow_uncertainty'] = shadow_u.mean()
+    metrics['shadow_confidence'] = shadow_conf.mean()
+
     inp = self.feat2tensor(imgfeat)
+    adjusted_con = self.con(inp, 2).prob(1) * shadow_conf
     los, imgloss_out, mets = imag_loss(
         imgact,
         self.rew(inp, 2).pred(),
-        self.con(inp, 2).prob(1),
+        adjusted_con,
         self.pol(inp, 2),
         self.val(inp, 2),
         self.slowval(inp, 2),
