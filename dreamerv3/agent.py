@@ -11,6 +11,7 @@ import numpy as np
 import optax
 
 from . import rssm
+from .shadow import ShadowModel
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -57,6 +58,17 @@ class Agent(embodied.jax.Agent):
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
 
+    shadow_kw = {k: v for k, v in config.shadow.items() if k != 'n_models'}
+    self.shadow = [
+        ShadowModel(
+            act_space,
+            classes=self.dyn.classes,
+            stoch=self.dyn.stoch,
+            unimix=self.dyn.unimix,
+            **shadow_kw,
+            name=f'shadow{i}')
+        for i in range(config.shadow.n_models)]
+
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
     self.pol = embodied.jax.MLPHead(
@@ -72,7 +84,8 @@ class Agent(embodied.jax.Agent):
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val,
+        *self.shadow]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -175,6 +188,27 @@ class Agent(embodied.jax.Agent):
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+
+    # Shadow ensemble: predict z_{t+1} from (z_t, a_t) as a lightweight,
+    # independently-initialized model of the RSSM's own transition, used to
+    # measure imagination uncertainty via ensemble disagreement. Trained by
+    # cross-entropy against the RSSM's own sampled posterior, with the RSSM
+    # treated as a fixed target (stop_gradient on every shadow input) so
+    # shadow training never influences the world model itself.
+    z = repfeat['stoch']
+    shadow_zt = sg(z[:, :-1])
+    shadow_target = sg(z[:, 1:])
+    shadow_at = {k: sg(v[:, :-1]) for k, v in prevact.items()}
+    shadow_logps = []
+    for shadow in self.shadow:
+      dist = shadow.dist(shadow(shadow_zt, shadow_at))
+      shadow_logps.append(dist.logp(shadow_target).sum(-1))
+    shadow_loss = -jnp.mean(jnp.stack(shadow_logps, 0), 0)
+    # No target exists for the last step (there is no z_{T} to predict from
+    # z_{T-1} within this chunk), so pad with zero to match (B, T).
+    losses['shadow'] = jnp.concatenate(
+        [shadow_loss, jnp.zeros_like(shadow_loss[:, :1])], 1)
+
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
