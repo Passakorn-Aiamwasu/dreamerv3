@@ -1,18 +1,27 @@
-"""Shadow-ensemble ablation (next-step 5): CPU smoke-scale comparison.
+"""Shadow-ensemble ablation (next-step 5): smoke-scale comparison.
 
-Trains the real dreamerv3.agent.Agent for a handful of optimizer steps on a
-small, fixed synthetic batch (there is no GPU or real environment available
-in this setting to run a full training loop), once with
-agent.shadow.enabled=True and once with it False, using config.shadow.enabled
-(added alongside this script) so the two runs differ only in whether the
-shadow ensemble trains and discounts `con` -- everything else (seeds, data,
-model sizes, optimizer) is identical.
+Trains the real dreamerv3.agent.Agent for a number of optimizer steps on a
+fixed synthetic batch, once with agent.shadow.enabled=True and once with it
+False (config.shadow.enabled, added alongside this script), so the two runs
+differ only in whether the shadow ensemble trains and discounts `con` --
+everything else (seeds, data, model size, optimizer) is identical.
 
 This is NOT a claim about task performance -- the "environment" here is
 random noise, so there's nothing to actually solve. It is a mechanical
 check: does the shadow-enabled run behave sanely (uncertainty/confidence
 finite and moving, other losses still optimize) relative to the exact same
 setup with the ensemble compiled out entirely.
+
+Scale is chosen automatically from the detected JAX backend (see
+`PLATFORM`/`SCALE` below): a real GPU gets a much larger, closer-to-production
+config (size12m, full batch_size/batch_length from configs.yaml's defaults);
+CPU-only falls back to the tiny debug+size1m config this script originally
+shipped with, since a size12m model run step-by-step, un-jitted-by-default
+Python loop on CPU is impractically slow. Nothing here hardcodes CPU --
+jax.jit picks up whatever backend the installed jaxlib was built for and
+the machine actually has (see requirements.txt's jax[cuda12] for the GPU
+wheel), so this same script is what you'd run on a GPU machine, not a
+separate version of it.
 """
 
 import pathlib
@@ -27,11 +36,17 @@ import ruamel.yaml as yaml
 from dreamerv3.agent import Agent
 from embodied.envs.dummy import Dummy
 
-BATCH = 4
-LENGTH = 8
-STEPS = 60
-
+PLATFORM = jax.devices()[0].platform  # 'cpu', 'gpu', or 'tpu'
 print("JAX devices:", jax.devices())
+
+if PLATFORM == 'cpu':
+  print("No GPU detected -- falling back to the tiny debug+size1m scale.")
+  SCALE = 'debug'
+  BATCH, LENGTH, STEPS = 4, 8, 60
+else:
+  print(f"{PLATFORM.upper()} detected -- using the larger size12m scale.")
+  SCALE = 'size12m'
+  BATCH, LENGTH, STEPS = 16, 64, 200
 
 
 # ============================================================
@@ -43,8 +58,11 @@ print("JAX devices:", jax.devices())
 root = pathlib.Path(__file__).parent / 'dreamerv3'
 raw = yaml.YAML(typ='safe').load((root / 'configs.yaml').read_text())
 base_config = elements.Config(raw['defaults'])
-base_config = base_config.update(raw['debug'])
-base_config = base_config.update(raw['size1m'])
+if SCALE == 'debug':
+  base_config = base_config.update(raw['debug'])
+  base_config = base_config.update(raw['size1m'])
+else:
+  base_config = base_config.update(raw[SCALE])
 base_config = base_config.update({'replay_context': 0})
 
 env = Dummy('disc', size=(64, 64), length=20)
