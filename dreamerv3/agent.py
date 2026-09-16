@@ -286,18 +286,19 @@ class Agent(embodied.jax.Agent):
     # Shadow ensemble uncertainty/confidence, queried at every imagined
     # step (imgact[:, t] is the action taken AT imgfeat[:, t], i.e. exactly
     # the (z_t, a_t) pair each shadow model was trained to predict from).
-    # Not yet applied to `con` -- that is the next integration step (mix
-    # shadow_conf into self.con(inp, 2).prob(1) before it reaches
-    # imag_loss()).
+    # Mixed into the continuation probability below (design decision #5)
+    # instead of hard-stopping the rollout, reusing imag_loss()'s existing
+    # discounting machinery.
     shadow_conf, shadow_u = self._shadow_confidence(imgfeat, imgact, training)
     metrics['shadow_uncertainty'] = shadow_u.mean()
     metrics['shadow_confidence'] = shadow_conf.mean()
 
     inp = self.feat2tensor(imgfeat)
+    adjusted_con = self.con(inp, 2).prob(1) * shadow_conf
     los, imgloss_out, mets = imag_loss(
         imgact,
         self.rew(inp, 2).pred(),
-        self.con(inp, 2).prob(1),
+        adjusted_con,
         self.pol(inp, 2),
         self.val(inp, 2),
         self.slowval(inp, 2),

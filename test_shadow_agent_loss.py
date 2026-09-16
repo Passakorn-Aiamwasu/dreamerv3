@@ -213,5 +213,35 @@ for i in range(config.agent.shadow.n_models):
   print(f"  shadow{i}/ gradient norm (should be > 0):", float(norm))
   assert float(norm) > 0.0, f"Shadow {i} received no gradient from its own loss!"
 
+# ============================================================
+# Step 3c check: shadow_conf is now mixed into `con` before imag_loss()
+# (adjusted_con = self.con(inp, 2).prob(1) * shadow_conf), so the
+# policy/value losses depend on it. That must not create a gradient path
+# into the shadow ensemble's own parameters -- shadow_conf is
+# stop_gradient'd inside _shadow_confidence(), so composing it into
+# adjusted_con must still yield exactly zero gradient into shadow{i}/
+# regardless of what lambda_return/imag_loss subsequently does with it.
+# ============================================================
+
+def policy_value_loss(params, carry, obs, prevact):
+  _, (_, aux) = nj.pure(loss_fn)(params, carry, obs, prevact, seed=123)
+  losses = aux[2]['losses']
+  return (losses['policy'] + losses['value']).mean()
+
+
+pv_grads = jax.grad(policy_value_loss)(params, carry, obs, prevact)
+
+print()
+print("Step 3c stop-gradient check (policy+value loss, via adjusted_con):")
+for i in range(config.agent.shadow.n_models):
+  keys = [k for k in pv_grads if k.startswith(f'shadow{i}/')]
+  norm = jnp.sqrt(sum(
+      jnp.sum(pv_grads[k].astype(jnp.float32) ** 2) for k in keys))
+  print(f"  shadow{i}/ gradient norm (should be 0):", float(norm))
+  assert float(norm) == 0.0, (
+      f"Gradient from policy/value loss leaked into shadow{i} params via "
+      "adjusted_con -- shadow_conf is not fully stop_gradient'd! The "
+      "policy could learn to make the ensemble agree with itself.")
+
 print()
 print("Shadow ensemble Agent.loss() integration PASS")
