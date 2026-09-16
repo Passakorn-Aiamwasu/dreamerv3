@@ -255,10 +255,20 @@ class Agent(embodied.jax.Agent):
       # Trained by cross-entropy against the RSSM's own sampled posterior,
       # with the RSSM treated as a fixed target (stop_gradient on every
       # shadow input) so shadow training never influences the world model.
+      # prevact[:, t] is the action that led INTO z_t (RSSM's "previous
+      # action" convention -- see _observe(), which uses it to step the
+      # carry from t-1 into t). The action that causes the z_t -> z_{t+1}
+      # transition being predicted here is therefore prevact[:, t+1], i.e.
+      # prevact[:, 1:] against z_t = z[:, :-1] -- not prevact[:, :-1],
+      # which would pair z_t with the action that produced z_t itself.
+      # This also matches the pairing the imagination block (RSSM.imagine,
+      # confirmed by tracing its single-step branch) already uses when
+      # querying the ensemble, so training and inference see the same
+      # (z_t, a_t) convention.
       z = repfeat['stoch']
       shadow_zt = sg(z[:, :-1])
       shadow_target = sg(z[:, 1:])
-      shadow_at = {k: sg(v[:, :-1]) for k, v in prevact.items()}
+      shadow_at = {k: sg(v[:, 1:]) for k, v in prevact.items()}
       shadow_logps = []
       for shadow in self.shadow:
         dist = shadow.dist(shadow(shadow_zt, shadow_at))
