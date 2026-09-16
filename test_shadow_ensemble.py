@@ -405,6 +405,27 @@ print(
 
 
 # ============================================================
+# Unimix verification: probs must stay strictly positive.
+#
+# With unimix mixing, probs = (1 - unimix) * softmax + unimix *
+# uniform, so no class can ever collapse to exactly 0 -- the
+# uniform term puts a floor of unimix / CLASSES under every
+# probability, regardless of how peaked the softmax gets. This
+# floor is what keeps logp() finite (no -inf) for any sampled
+# target, including classes the shadow model currently considers
+# very unlikely.
+# ============================================================
+
+probs_min = float(metrics['probs'].min())
+unimix_floor = UNIMIX / CLASSES
+
+print()
+print("Unimix verification:")
+print("  probs.min():", probs_min)
+print("  theoretical floor (unimix / classes):", unimix_floor)
+
+
+# ============================================================
 # Individual Shadow losses
 # ============================================================
 
@@ -588,6 +609,33 @@ assert float(metrics['logp_consistency_error']) < 1e-3, (
     "Inspect dreamerv3/shadow.py's dist()/OneHot usage and "
     "embodied/jax/outs.py's Categorical/OneHot implementation "
     "before trusting the disagreement metric."
+)
+
+
+# --------------------------------------------------
+# Unimix verification: no class probability should ever be able
+# to collapse to zero. probs = (1 - unimix) * softmax + unimix *
+# uniform guarantees probs >= unimix / classes for every entry,
+# since softmax >= 0. A near-zero probs.min() (or one at/below the
+# theoretical floor) would mean unimix is not actually being
+# applied, e.g. shadow.dist() was called with unimix=0 or the
+# OneHot mixing was bypassed.
+# --------------------------------------------------
+
+assert probs_min > 0.0, (
+    "Shadow ensemble probs contain a zero (or negative) entry -- "
+    "unimix does not appear to be applied (probs.min() = "
+    f"{probs_min}). Check that shadow.dist() is constructed with "
+    "unimix > 0 and that dreamerv3/shadow.py passes self.unimix "
+    "through to OneHot."
+)
+
+assert probs_min >= unimix_floor - 1e-6, (
+    "Shadow ensemble probs.min() is below the theoretical unimix "
+    f"floor of unimix / classes ({unimix_floor}): got {probs_min}. "
+    "This should be mathematically impossible if unimix mixing is "
+    "applied correctly -- check dreamerv3/shadow.py's dist() and "
+    "embodied/jax/outs.py's Categorical unimix mixing."
 )
 
 
