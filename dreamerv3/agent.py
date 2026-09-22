@@ -314,13 +314,12 @@ class Agent(embodied.jax.Agent):
 
     inp = self.feat2tensor(imgfeat)
     adjusted_con = self.con(inp, 2).prob(1)
+    shadow_traj_conf = None
     if self.config.shadow.enabled:
       # Shadow ensemble uncertainty/confidence, queried at every imagined
       # step (imgact[:, t] is the action taken AT imgfeat[:, t], i.e.
       # exactly the (z_t, a_t) pair each shadow model was trained to
-      # predict from). Mixed into the continuation probability (design
-      # decision #5) instead of hard-stopping the rollout, reusing
-      # imag_loss()'s existing discounting machinery.
+      # predict from).
       shadow_conf, shadow_u, shadow_u_tilde = self._shadow_confidence(
           imgfeat, imgact, training)
       metrics['shadow_uncertainty'] = shadow_u.mean()
@@ -340,7 +339,29 @@ class Agent(embodied.jax.Agent):
           shadow_u_tilde, 75)
       metrics['shadow_uncertainty_tilde_p90'] = jnp.percentile(
           shadow_u_tilde, 90)
-      adjusted_con = adjusted_con * shadow_conf
+      # Two ways to turn C_t into a discount, selected by
+      # config.shadow.confidence_mode:
+      #   'per_step': mix C_t into con before it reaches imag_loss(), so
+      #     it compounds through cumprod() over the imagination horizon
+      #     exactly like a termination probability would (design
+      #     decision #5's original formulation). A few steps of
+      #     middling confidence can crush a long-horizon return even
+      #     with no single step being clearly wrong.
+      #   'trajectory': leave con untouched (world-model termination
+      #     stays governed only by the world model's own prediction) and
+      #     instead scale the whole trajectory's policy/value loss by
+      #     one confidence number -- the average C_t over the rollout --
+      #     applied once rather than compounded H+1 times. This changes
+      #     how much an uncertain trajectory counts toward the loss, not
+      #     what the world model predicts will happen in it.
+      mode = self.config.shadow.confidence_mode
+      if mode == 'per_step':
+        adjusted_con = adjusted_con * shadow_conf
+      elif mode == 'trajectory':
+        shadow_traj_conf = shadow_conf.mean(1, keepdims=True)
+        metrics['shadow_confidence_traj'] = shadow_traj_conf.mean()
+      else:
+        raise NotImplementedError(mode)
     los, imgloss_out, mets = imag_loss(
         imgact,
         self.rew(inp, 2).pred(),
@@ -353,6 +374,10 @@ class Agent(embodied.jax.Agent):
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
         **self.config.imag_loss)
+    if shadow_traj_conf is not None:
+      los = dict(los)
+      los['policy'] = los['policy'] * shadow_traj_conf
+      los['value'] = los['value'] * shadow_traj_conf
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
 
