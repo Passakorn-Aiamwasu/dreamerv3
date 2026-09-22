@@ -95,7 +95,7 @@ defaults:
     dec:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
-    shadow: {enabled: True, n_models: 3, units: 1024, layers: 2, alpha: 1.0, tau: 1.0, ema_decay: 0.99}
+    shadow: {enabled: True, n_models: 3, units: 1024, layers: 2, alpha: 0.3, tau: 2.0, ema_decay: 0.99}
     rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
     policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}

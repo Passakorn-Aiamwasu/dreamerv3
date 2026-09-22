@@ -167,10 +167,13 @@ for key in shared_keys:
 
 print()
 print("Shadow-only metrics (with-shadow run):")
-for key in ['loss/shadow', 'shadow_uncertainty', 'shadow_confidence']:
+for key in ['loss/shadow', 'shadow_uncertainty', 'shadow_uncertainty_tilde',
+            'shadow_uncertainty_tilde_p50', 'shadow_uncertainty_tilde_p75',
+            'shadow_uncertainty_tilde_p90', 'shadow_confidence',
+            'shadow_confidence_min']:
   vals = [row[key] for row in with_shadow if key in row]
   if vals:
-    print(f"  {key:<20} first={vals[0]:.4f} last={vals[-1]:.4f}")
+    print(f"  {key:<28} first={vals[0]:.4f} last={vals[-1]:.4f}")
 
 assert 'loss/shadow' not in without_shadow[0], (
     "shadow.enabled=False run still logged loss/shadow -- ablation toggle "

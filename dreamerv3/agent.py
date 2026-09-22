@@ -217,13 +217,21 @@ class Agent(embodied.jax.Agent):
       self.shadow_u_ema.write(ema)
     else:
       ema = jnp.where(bootstrap, u_mean, ema)
+    # self.shadow_u_ema.read() is a plain parameter entry, not something
+    # jax.grad would normally treat as a constant -- explicitly stop it
+    # here (it's a running statistic updated by .write(), never by
+    # gradient descent, and doesn't depend on any trainable module's
+    # params anyway) so u_tilde/conf are provably detached from
+    # everything, not just from what self.modules happens to restrict the
+    # real optimizer to.
+    ema = sg(ema)
     u_tilde = u / (ema + EPS)
 
     # Confidence weight (design decision #5): always stop_gradient'd so the
     # policy can never learn to make the ensemble agree with itself.
     conf = jnp.exp(-self.config.shadow.alpha * jnp.maximum(
         u_tilde - self.config.shadow.tau, 0.0))
-    return sg(conf), u
+    return sg(conf), sg(u), sg(u_tilde)
 
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
@@ -313,10 +321,25 @@ class Agent(embodied.jax.Agent):
       # predict from). Mixed into the continuation probability (design
       # decision #5) instead of hard-stopping the rollout, reusing
       # imag_loss()'s existing discounting machinery.
-      shadow_conf, shadow_u = self._shadow_confidence(
+      shadow_conf, shadow_u, shadow_u_tilde = self._shadow_confidence(
           imgfeat, imgact, training)
       metrics['shadow_uncertainty'] = shadow_u.mean()
       metrics['shadow_confidence'] = shadow_conf.mean()
+      metrics['shadow_confidence_min'] = shadow_conf.min()
+      # Diagnostics for calibrating alpha/tau (see next-step notes): U_t
+      # before EMA normalization, Ũ_t after, and percentiles of Ũ_t so tau
+      # can be set from data (e.g. tau ~= observed p75-p90) instead of
+      # guessed -- with tau=1.0, Ũ_t exceeds tau on ~half of all steps by
+      # construction (it fluctuates around its own running mean), which
+      # compounds into a large effective discount over the imagination
+      # horizon (e.g. 0.87^15 ~= 0.12) even when nothing is actually wrong.
+      metrics['shadow_uncertainty_tilde'] = shadow_u_tilde.mean()
+      metrics['shadow_uncertainty_tilde_p50'] = jnp.percentile(
+          shadow_u_tilde, 50)
+      metrics['shadow_uncertainty_tilde_p75'] = jnp.percentile(
+          shadow_u_tilde, 75)
+      metrics['shadow_uncertainty_tilde_p90'] = jnp.percentile(
+          shadow_u_tilde, 90)
       adjusted_con = adjusted_con * shadow_conf
     los, imgloss_out, mets = imag_loss(
         imgact,
