@@ -1,0 +1,41 @@
+# Pinned, reproducible RunPod environment for DynamicDreamer (DreamerV3 +
+# shadow ensemble). Mirrors requirements.txt but with every version pinned
+# exactly instead of >=/<, so `pip install -r requirements-runpod.txt`
+# produces the same environment on every fresh Pod, plus the MuJoCo /
+# dm_control stack needed for DMC-suite environments (configs.yaml's
+# `env.dmc` / `dmc_proprio` / `dmc_vision` presets).
+#
+# jax/jaxlib/the CUDA plugin all come from the jax[cuda12] extra, matching
+# what requirements.txt already uses and this repo is tested against --
+# pinning the cuda12 plugin sub-packages separately was considered and
+# deliberately skipped: there's no GPU available to verify it against, and
+# an unverified alternate pin is a worse bet than the extra the repo
+# itself ships with. See https://jax.readthedocs.io/en/latest/installation.html
+# if jax[cuda12]==0.4.33 ever needs to be swapped for explicit
+# jax-cuda12-plugin/jax-cuda12-pjrt pins.
+jax[cuda12]==0.4.33
+numpy==1.26.4
+ml-dtypes==0.4.1
+
+# MuJoCo / dm_control for DMC-suite training.
+mujoco==3.1.6
+dm-control==1.0.20
+
+# Everything else from requirements.txt, pinned.
+ale_py==0.9.0
+autorom[accept-rom-license]==0.6.1
+av
+chex
+colored_traceback
+einops
+elements==3.19.1
+google-resumable-media==2.7.2
+granular==0.20.3
+ipdb
+jaxtyping
+ninjax==3.5.1
+nvidia-cuda-nvcc-cu12==12.2
+optax
+portal==3.5.0
+scope==0.4.4
+tqdm

@@ -1,10 +1,17 @@
-"""Shadow-ensemble ablation (next-step 5): smoke-scale comparison.
+"""Shadow-ensemble ablation (next-steps 5 and 4): smoke-scale comparison.
 
 Trains the real dreamerv3.agent.Agent for a number of optimizer steps on a
-fixed synthetic batch, once with agent.shadow.enabled=True and once with it
-False (config.shadow.enabled, added alongside this script), so the two runs
-differ only in whether the shadow ensemble trains and discounts `con` --
-everything else (seeds, data, model size, optimizer) is identical.
+fixed synthetic batch, under three conditions that differ only in
+config.shadow.enabled / config.shadow.confidence_mode -- everything else
+(seeds, data, model size, optimizer) is identical:
+
+  - no_shadow:    shadow.enabled=False (baseline, ensemble compiled out)
+  - per_step:     shadow.enabled=True, confidence_mode='per_step' (default
+                  -- C_t multiplied into `con` every imagined step, so it
+                  compounds through imag_loss()'s cumprod over the horizon)
+  - trajectory:   shadow.enabled=True, confidence_mode='trajectory' (next-
+                  step 4 -- con is left untouched; the trajectory's mean
+                  C_t instead scales the whole policy/value loss once)
 
 This is NOT a claim about task performance -- the "environment" here is
 random noise, so there's nothing to actually solve. It is a mechanical
@@ -101,8 +108,15 @@ prevact = make_batch(act_space, BATCH, LENGTH, seed=1)
 # on the same fixed batch, recording per-step loss/* and shadow_* metrics.
 # ============================================================
 
-def run_condition(shadow_enabled, seed):
-  config = base_config.update({'agent': {'shadow': {'enabled': shadow_enabled}}})
+CONDITIONS = {
+    'no_shadow': {'enabled': False},
+    'per_step': {'enabled': True, 'confidence_mode': 'per_step'},
+    'trajectory': {'enabled': True, 'confidence_mode': 'trajectory'},
+}
+
+
+def run_condition(name, shadow_overrides, seed):
+  config = base_config.update({'agent': {'shadow': shadow_overrides}})
   model = object.__new__(Agent)
   Agent.__init__(model, obs_space, act_space, config.agent)
   carry = model.init_train(BATCH)[:3]
@@ -132,18 +146,15 @@ def run_condition(shadow_enabled, seed):
     row = {k: float(v) for k, v in metrics.items() if np.ndim(v) == 0}
     history.append(row)
     if step == 0 or step == STEPS - 1:
-      print(f"  [{'shadow' if shadow_enabled else 'no_shadow'}] "
-            f"step {step}: opt/loss={row.get('opt/loss', float('nan')):.4f}")
+      print(f"  [{name}] step {step}: opt/loss={row.get('opt/loss', float('nan')):.4f}")
   return history
 
 
-print()
-print(f"Running {STEPS} optimizer steps WITH shadow ensemble...")
-with_shadow = run_condition(True, seed=42)
-
-print()
-print(f"Running {STEPS} optimizer steps WITHOUT shadow ensemble...")
-without_shadow = run_condition(False, seed=42)
+results = {}
+for name, overrides in CONDITIONS.items():
+  print()
+  print(f"Running {STEPS} optimizer steps -- condition '{name}' ({overrides})...")
+  results[name] = run_condition(name, overrides, seed=42)
 
 
 # ============================================================
@@ -154,36 +165,50 @@ shared_keys = ['loss/dyn', 'loss/rep', 'loss/rew', 'loss/con',
                'loss/policy', 'loss/value', 'opt/loss']
 
 print()
-print("=" * 70)
-print(f"{'metric':<16} {'with[0]':>10} {'with[-1]':>10} "
-      f"{'no[0]':>10} {'no[-1]':>10}")
-print("=" * 70)
+print("=" * 88)
+header = f"{'metric':<16}"
+for name in CONDITIONS:
+  header += f"{name + '[0]':>18}{name + '[-1]':>18}"
+print(header)
+print("=" * 88)
 for key in shared_keys:
-  w0, w1 = with_shadow[0].get(key), with_shadow[-1].get(key)
-  n0, n1 = without_shadow[0].get(key), without_shadow[-1].get(key)
-  if w0 is None or n0 is None:
-    continue
-  print(f"{key:<16} {w0:>10.4f} {w1:>10.4f} {n0:>10.4f} {n1:>10.4f}")
+  row = f"{key:<16}"
+  missing = False
+  for name in CONDITIONS:
+    v0, v1 = results[name][0].get(key), results[name][-1].get(key)
+    if v0 is None:
+      missing = True
+      break
+    row += f"{v0:>18.4f}{v1:>18.4f}"
+  if not missing:
+    print(row)
 
-print()
-print("Shadow-only metrics (with-shadow run):")
-for key in ['loss/shadow', 'shadow_uncertainty', 'shadow_uncertainty_tilde',
-            'shadow_uncertainty_tilde_p50', 'shadow_uncertainty_tilde_p75',
-            'shadow_uncertainty_tilde_p90', 'shadow_confidence',
-            'shadow_confidence_min']:
-  vals = [row[key] for row in with_shadow if key in row]
-  if vals:
-    print(f"  {key:<28} first={vals[0]:.4f} last={vals[-1]:.4f}")
+for name in ('per_step', 'trajectory'):
+  print()
+  print(f"Shadow-only metrics ('{name}' run):")
+  for key in ['loss/shadow', 'shadow_uncertainty', 'shadow_uncertainty_tilde',
+              'shadow_uncertainty_tilde_p50', 'shadow_uncertainty_tilde_p75',
+              'shadow_uncertainty_tilde_p90', 'shadow_confidence',
+              'shadow_confidence_min', 'shadow_confidence_traj']:
+    vals = [row[key] for row in results[name] if key in row]
+    if vals:
+      print(f"  {key:<28} first={vals[0]:.4f} last={vals[-1]:.4f}")
 
-assert 'loss/shadow' not in without_shadow[0], (
+assert 'loss/shadow' not in results['no_shadow'][0], (
     "shadow.enabled=False run still logged loss/shadow -- ablation toggle "
     "is not actually disabling the shadow loss.")
-assert 'shadow_confidence' not in without_shadow[0], (
+assert 'shadow_confidence' not in results['no_shadow'][0], (
     "shadow.enabled=False run still logged shadow_confidence -- ablation "
     "toggle is not actually disabling the confidence weighting.")
-for key in shared_keys:
-  assert all(np.isfinite(row[key]) for row in with_shadow if key in row)
-  assert all(np.isfinite(row[key]) for row in without_shadow if key in row)
+assert 'shadow_confidence_traj' not in results['per_step'][0], (
+    "'per_step' run logged shadow_confidence_traj -- that metric is "
+    "'trajectory'-mode only.")
+assert 'shadow_confidence_traj' in results['trajectory'][0], (
+    "'trajectory' run did not log shadow_confidence_traj -- confidence_mode "
+    "did not take effect.")
+for name in CONDITIONS:
+  for key in shared_keys:
+    assert all(np.isfinite(row[key]) for row in results[name] if key in row)
 
 print()
 print("Ablation smoke run PASS")
@@ -197,6 +222,6 @@ import json
 
 out_dir = pathlib.Path(__file__).parent / 'ablation_results'
 out_dir.mkdir(exist_ok=True)
-(out_dir / 'with_shadow.json').write_text(json.dumps(with_shadow))
-(out_dir / 'without_shadow.json').write_text(json.dumps(without_shadow))
+for name, history in results.items():
+  (out_dir / f'{name}.json').write_text(json.dumps(history))
 print(f"\nSaved raw per-step histories to {out_dir}/")
