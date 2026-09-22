@@ -109,8 +109,8 @@ def make_fn(model, training):
     lastact = jax.tree.map(lambda x: x[:, None], lastact)
     imgact = concat([imgprevact, lastact], 1)
 
-    conf, u = model._shadow_confidence(imgfeat, imgact, training)
-    return imgfeat, imgact, conf, u
+    conf, u, u_tilde = model._shadow_confidence(imgfeat, imgact, training)
+    return imgfeat, imgact, conf, u, u_tilde
   return fn
 
 
@@ -127,9 +127,9 @@ print("Initial shadow_u_ema:", float(params['shadow_u_ema/value']))
 
 def run(params, training, seed):
   fn = fn_train if training else fn_eval
-  new_params, (imgfeat, imgact, conf, u) = nj.pure(fn)(
+  new_params, (imgfeat, imgact, conf, u, u_tilde) = nj.pure(fn)(
       params, carry, obs, prevact, seed=seed)
-  return new_params, imgfeat, imgact, conf, u
+  return new_params, imgfeat, imgact, conf, u, u_tilde
 
 
 # ============================================================
@@ -140,7 +140,7 @@ H = config.agent.imag_length
 K = min(config.agent.imag_last or LENGTH, LENGTH)
 expected_shape = (BATCH * K, H + 1)
 
-params, imgfeat, imgact, conf, u = run(params, True, 123)
+params, imgfeat, imgact, conf, u, u_tilde = run(params, True, 123)
 
 print()
 print("imgfeat/imgact time steps:", H + 1)
@@ -148,13 +148,21 @@ print("shadow_confidence shape:", conf.shape)
 print("shadow_uncertainty shape:", u.shape)
 assert conf.shape == expected_shape, conf.shape
 assert u.shape == expected_shape, u.shape
+assert u_tilde.shape == expected_shape, u_tilde.shape
 
-print("shadow_uncertainty:", float(u.mean()), "min", float(u.min()), "max", float(u.max()))
+print("shadow_uncertainty (U_t):", float(u.mean()), "min", float(u.min()), "max", float(u.max()))
+print(
+    "shadow_uncertainty_tilde (U_t/EMA):", float(u_tilde.mean()),
+    "p50", float(jnp.percentile(u_tilde, 50)),
+    "p75", float(jnp.percentile(u_tilde, 75)),
+    "p90", float(jnp.percentile(u_tilde, 90)))
 print("shadow_confidence:", float(conf.mean()), "min", float(conf.min()), "max", float(conf.max()))
 
 assert jnp.isfinite(u).all()
+assert jnp.isfinite(u_tilde).all()
 assert jnp.isfinite(conf).all()
 assert float(u.min()) >= 0.0, "KL-based disagreement must be non-negative"
+assert float(u_tilde.min()) >= 0.0, "normalized disagreement must be non-negative"
 assert float(conf.min()) > 0.0, "confidence weight must be strictly positive"
 assert float(conf.max()) <= 1.0 + 1e-6, "confidence weight must be <= 1"
 
@@ -187,8 +195,9 @@ assert ema2 == ema1, (
 # ============================================================
 
 def conf_sum_loss(params, carry, obs, prevact):
-  _, (_, _, conf, u) = nj.pure(fn_train)(params, carry, obs, prevact, seed=123)
-  return conf.sum() + u.sum()
+  _, (_, _, conf, u, u_tilde) = nj.pure(fn_train)(
+      params, carry, obs, prevact, seed=123)
+  return conf.sum() + u.sum() + u_tilde.sum()
 
 
 conf_grads = jax.grad(conf_sum_loss)(params, carry, obs, prevact)
